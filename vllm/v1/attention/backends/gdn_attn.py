@@ -89,6 +89,17 @@ class GDNAttentionBackend(AttentionBackend):
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         return True
 
+    # qwen35-0diff: the GDN kernels (FlashInfer/FLA chunk prefill, FLA decode
+    # update, in-tree causal_conv1d) operate per sequence via cu_seqlens with
+    # fixed-size chunks, so they are expected to be batch-invariant in effect;
+    # this was never validated upstream, hence the blanket reject. Declared
+    # True here and verified empirically with the C1 batch-invariance harness
+    # (scratch/c1_bi_baseline.py): same-batch repeat must stay bitwise exact
+    # AND cross-batch-composition legs must match before this is trusted.
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        return True
+
 
 @dataclass
 class GDNAttentionMetadata:
