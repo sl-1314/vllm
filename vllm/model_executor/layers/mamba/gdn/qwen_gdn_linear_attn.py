@@ -1887,7 +1887,55 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 1.2: Process the remaining part
         conv_input_non_spec = mixed_qkv_non_spec
-        if attn_metadata.num_prefills > 0:
+        # Batch invariance (mixed steps): the decode rows of a mixed
+        # chunked-prefill+decode step would otherwise ride the varlen prefill
+        # kernels (causal_conv1d_fn over 1-token segments +
+        # fused_sigmoid_gating_delta_rule_update), whose numerics differ by
+        # fp32 ulps from the pure-decode kernels (causal_conv1d_update +
+        # packed recurrent decode) the same rows hit in a decode-only step.
+        # The GDN recurrence amplifies those ulps into logprob drift, so under
+        # batch-invariant mode peel the decode-first front slice onto the
+        # pure-decode kernels and leave the prefill rows on the (row-invariant)
+        # prefill kernels, using the metadata builder's pre-peeled prefill
+        # fields (rebased cu_seqlens / state indices / initial-state mask).
+        bi_mixed = (
+            envs.VLLM_BATCH_INVARIANT
+            and self.enable_packed_recurrent_decode
+            and spec_sequence_masks is None
+            and attn_metadata.num_prefills > 0
+            and attn_metadata.num_decodes > 0
+        )
+        if bi_mixed:
+            assert mixed_qkv_non_spec is not None
+            assert non_spec_state_indices_tensor is not None
+            assert attn_metadata.prefill_query_start_loc is not None
+            assert attn_metadata.prefill_state_indices is not None
+            assert attn_metadata.prefill_has_initial_state is not None
+            num_decode_tokens = attn_metadata.num_decode_tokens
+            mixed_qkv_decode = causal_conv1d_update(
+                mixed_qkv_non_spec[:num_decode_tokens],
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=non_spec_state_indices_tensor[:num_decode_tokens],  # type: ignore[index]
+                validate_data=False,
+            )
+            # metadata is None here: the prebuilt conv metadata describes the
+            # full non-spec batch, not this rebased prefill-only layout, so
+            # let causal_conv1d_fn recompute the seqlens itself.
+            mixed_qkv_prefill = causal_conv1d_fn(
+                mixed_qkv_non_spec[num_decode_tokens:].transpose(0, 1),
+                conv_weights,
+                self.conv1d.bias,
+                activation=self.activation,
+                conv_states=conv_state,
+                has_initial_state=attn_metadata.prefill_has_initial_state,
+                cache_indices=attn_metadata.prefill_state_indices,
+                query_start_loc=attn_metadata.prefill_query_start_loc,
+            ).transpose(0, 1)
+            mixed_qkv_non_spec = torch.cat([mixed_qkv_decode, mixed_qkv_prefill])
+        elif attn_metadata.num_prefills > 0:
             assert mixed_qkv_non_spec is not None
             mixed_qkv_non_spec_T = mixed_qkv_non_spec.transpose(0, 1)
             # - "cache_indices" updates the conv_state cache in positions
@@ -2008,25 +2056,44 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         # 2.2: Process non-spec-decode part
         if split_non_spec:
-            query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
-                mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
-            )
-            core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
-                A_log=self.A_log,
-                a=a[:num_decode_tokens],
-                b=b[:num_decode_tokens],
-                dt_bias=self.dt_bias,
-                q=query_decode,
-                k=key_decode,
-                v=value_decode,
-                initial_state=ssm_state,
-                inplace_final_state=True,
-                cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
-                    : attn_metadata.num_decodes + 1
-                ],
-                ssm_state_indices=non_spec_state_indices_tensor,
-                use_qk_l2norm_in_kernel=True,
-            )
+            if bi_mixed:
+                # Packed recurrent decode writes the decode rows' outputs and
+                # final states in place, exactly as a decode-only step would.
+                fused_recurrent_gated_delta_rule_packed_decode(
+                    mixed_qkv=mixed_qkv_non_spec[:num_decode_tokens],  # type: ignore[index]
+                    a=a[:num_decode_tokens],
+                    b=b[:num_decode_tokens],
+                    A_log=self.A_log,
+                    dt_bias=self.dt_bias,
+                    scale=self.head_k_dim**-0.5,
+                    initial_state=ssm_state,
+                    out=core_attn_out[:num_decode_tokens].unsqueeze(1),
+                    ssm_state_indices=non_spec_state_indices_tensor[  # type: ignore[index]
+                        :num_decode_tokens
+                    ],
+                    use_qk_l2norm_in_kernel=True,
+                )
+                core_attn_out_decode = None
+            else:
+                query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
+                    mixed_qkv_non_spec[:num_decode_tokens]  # type: ignore[index]
+                )
+                core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
+                    A_log=self.A_log,
+                    a=a[:num_decode_tokens],
+                    b=b[:num_decode_tokens],
+                    dt_bias=self.dt_bias,
+                    q=query_decode,
+                    k=key_decode,
+                    v=value_decode,
+                    initial_state=ssm_state,
+                    inplace_final_state=True,
+                    cu_seqlens=non_spec_query_start_loc[  # type: ignore[index]
+                        : attn_metadata.num_decodes + 1
+                    ],
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                    use_qk_l2norm_in_kernel=True,
+                )
         else:
             core_attn_out_decode = None
 
@@ -2087,8 +2154,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # Init cache
             scatter_states(ssm_state, last_recurrent_state, prefill_state_indices)
 
-            if split_non_spec and prefill_in_place:
+            if split_non_spec and prefill_in_place and not bi_mixed:
                 core_attn_out[:num_decode_tokens] = core_attn_out_decode.squeeze(0)
+            elif split_non_spec and bi_mixed:
+                # Packed decode already wrote the front slice in place; only
+                # the standalone (non-in-place) chunk backend needs a splice
+                # of the prefill outputs behind it.
+                if not prefill_in_place:
+                    core_attn_out[num_decode_tokens:num_actual_tokens] = (
+                        core_attn_out_non_spec.squeeze(0)
+                    )
             elif split_non_spec:
                 # Stitch the peeled decode outputs in front of the prefill
                 # outputs (decode-first order).
@@ -2126,7 +2201,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
-        elif not prefill_in_place:
+        elif not prefill_in_place and not bi_mixed:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
     def _forward_flashinfer_prefill(
