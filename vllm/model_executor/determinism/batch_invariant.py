@@ -1407,7 +1407,7 @@ def enable_batch_invariant_mode():
             # optionally install the triton persistent matmul overrides too.
             current_platform.is_cuda()
             and current_platform.is_device_capability_family(90)
-            and envs.is_set("VLLM_BI_FORCE_TRITON_MM")
+            and os.environ.get("VLLM_BI_FORCE_TRITON_MM")
         ):
             # Neither cuBLASLt on SM80 (Ampere) nor hipBLASLt can be made batch
             # invariant; install the triton persistent matmul overrides for
