@@ -118,6 +118,28 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
 
+def _qwen35_0diff_tail_kernel_ptx() -> dict:
+    """qwen35-0diff: PTX fingerprints of the fused gated-norm Triton kernel
+    (all compiled variants so far), for cross-process binary comparison."""
+    import hashlib
+
+    try:
+        from vllm.models.qwen3_5.nvidia.ops.fused_gdn_gated_norm import (
+            _fused_gdn_gated_rms_norm_kernel as _tk,
+        )
+    except Exception:
+        return {}
+    out = {}
+    for _dev, _entry in _tk.device_caches.items():
+        for _key, _ck in _entry[0].items():
+            try:
+                ptx = _ck.asm["ptx"]
+                out[str(_key)] = hashlib.sha256(ptx.encode()).hexdigest()[:16]
+            except Exception:
+                out[str(_key)] = "no-ptx"
+    return out
+
+
 def _qwen35_0diff_gdn_dump(num_tokens: int, tensors: dict) -> None:
     """qwen35-0diff (branch qwen35-0diff-gdn-fla): env-gated in-engine capture of
     GDN prefill sub-boundary tensors (conv in/out, post-conv-prep q/k/v/g/beta,
@@ -1456,6 +1478,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and not self.gqa_interleaved_layout
         ):
             out2d = core_attn_out.view(num_tokens, -1)
+            # qwen35-0diff: capture the actual tail inputs before the
+            # in-place fused norm overwrites out2d.
+            _0diff_tail_io = (
+                (z.detach().clone(), out2d.detach().clone())
+                if os.environ.get("VLLM_GDN_DUMP_DIR")
+                else None
+            )
             out_proj_input = self._fused_gdn_gated_rms_norm(
                 x=out2d,
                 z=z,
@@ -1468,6 +1497,42 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 norm_before_gate=self.norm.norm_before_gate,
                 activation=self.norm.activation,
             )
+            # qwen35-0diff: tail sub-boundary capture (z / pre-norm core /
+            # post-norm out_proj input).
+            if _0diff_tail_io is not None:
+                _0diff_z, _0diff_x = _0diff_tail_io
+                # in-engine re-run: same kernel, cloned inputs, separate
+                # output, contiguous z — isolates in-place/stride/process
+                # effects on the numerics.
+                _re_out = torch.empty_like(_0diff_x)
+                self._fused_gdn_gated_rms_norm(
+                    x=_0diff_x.clone(),
+                    z=_0diff_z.contiguous(),
+                    weight=self.norm.weight,
+                    out=_re_out,
+                    out_proj=self.out_proj,
+                    eps=self.norm.eps,
+                    num_v_heads=self.num_v_heads // self.tp_size,
+                    head_v_dim=self.head_v_dim,
+                    norm_before_gate=self.norm.norm_before_gate,
+                    activation=self.norm.activation,
+                )
+                _qwen35_0diff_gdn_dump(
+                    num_tokens,
+                    {
+                        "z_tail": _0diff_z,
+                        "tail_in": _0diff_x,
+                        "tail_out": out_proj_input.detach().clone(),
+                        "tail_recheck": _re_out,
+                        "norm_meta": {
+                            "weight_dtype": str(self.norm.weight.dtype),
+                            "norm_before_gate": self.norm.norm_before_gate,
+                            "activation": self.norm.activation,
+                            "eps": self.norm.eps,
+                        },
+                        "kernel_ptx": _qwen35_0diff_tail_kernel_ptx(),
+                    },
+                )
             output, _ = self.out_proj(out_proj_input)
             return output
 
