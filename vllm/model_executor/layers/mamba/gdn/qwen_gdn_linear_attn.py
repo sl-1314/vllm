@@ -426,6 +426,21 @@ def fi_chunk_gated_delta_rule(
     fi_g = g.to(torch.float32)
     fi_beta = beta.to(torch.float32)
     # cu_seqlens goes through as is: FlashInfer accepts int32 and int64.
+    #
+    # Batch invariance: FlashInfer's "auto" use_cp heuristic picks the kernel
+    # route from num_seqs * num_sab_heads vs an SM-count threshold
+    # (should_use_cp_host), so the route -- and with it the numerics -- flips
+    # with batch composition (e.g. num_seqs 1 -> 2 on a 78-SM H20). Pin the
+    # non-CP route under batch-invariant mode, or explicitly via
+    # VLLM_GDN_USE_CP=0/1 (takes precedence over the BI default).
+    if use_cp == "auto":
+        pin = envs.VLLM_GDN_USE_CP
+        if pin == "0":
+            use_cp = False
+        elif pin == "1":
+            use_cp = True
+        elif envs.VLLM_BATCH_INVARIANT:
+            use_cp = False
     result = chunk_gated_delta_rule_fi(
         q=q,
         k=k,
