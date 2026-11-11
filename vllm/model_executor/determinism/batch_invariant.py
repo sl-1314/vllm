@@ -1399,6 +1399,15 @@ def enable_batch_invariant_mode():
     if current_platform.is_cuda_alike():
         if current_platform.is_rocm() or current_platform.is_device_capability_family(
             80
+        ) or (
+            # qwen35-0diff: upstream SM90/SM100 only pins the cuBLAS workspace
+            # to kill split-k, assuming that is the sole batch-variance source.
+            # Measured false for Qwen3.5-35B-A3B (C1 harness: cross-batch
+            # logprob divergence persists with only the workspace pins), so
+            # optionally install the triton persistent matmul overrides too.
+            current_platform.is_cuda()
+            and current_platform.is_device_capability_family(90)
+            and envs.is_set("VLLM_BI_FORCE_TRITON_MM")
         ):
             # Neither cuBLASLt on SM80 (Ampere) nor hipBLASLt can be made batch
             # invariant; install the triton persistent matmul overrides for
@@ -1413,10 +1422,13 @@ def enable_batch_invariant_mode():
             _batch_invariant_LIB.impl("aten::addmm.out", addmm_out_batch_invariant, key)
             _batch_invariant_LIB.impl("aten::matmul", matmul_batch_invariant, key)
             _batch_invariant_LIB.impl("aten::linear", linear_batch_invariant, key)
-        else:
-            # Hopper (SM90) and Blackwell (SM100): the only source of batch
-            # variance is split-k, which we disable via the cuBLAS workspace
-            # config.
+        if not current_platform.is_rocm() and not current_platform.is_device_capability_family(
+            80
+        ):
+            # Hopper (SM90) and Blackwell (SM100): split-k is disabled via the
+            # cuBLAS workspace config (kept even when the triton overrides
+            # above are forced on: any cuBLAS user outside the aten ops still
+            # benefits).
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
             os.environ["CUBLASLT_WORKSPACE_SIZE"] = "1"
 
