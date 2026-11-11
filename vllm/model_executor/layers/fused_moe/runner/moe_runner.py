@@ -3,6 +3,7 @@
 from collections.abc import Callable, Iterable
 from contextlib import nullcontext
 from typing import TYPE_CHECKING, cast
+import os
 
 import torch
 import torch.nn.functional as F
@@ -61,6 +62,30 @@ from vllm.utils.torch_utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _qwen35_0diff_moe_sub_dump(num_tokens: int, tensors: dict) -> None:
+    """qwen35-0diff (branch qwen35-0diff-gdn-fla): env-gated capture of the
+    MoE combine inputs (routed fused output, shared-expert output) for
+    expert-path bitwise attribution (C3).  Instrumentation only.
+
+    Note: with multi-stream shared-expert overlap the shared output is
+    produced on the aux stream and synced before the combine, so values
+    captured here are the exact combine operands.
+    """
+    dump_dir = os.environ.get("VLLM_MOE_SUB_DUMP_DIR")
+    if not dump_dir:
+        return
+    try:
+        max_t = int(os.environ.get("VLLM_MOE_DUMP_MAX_T", "2048"))
+    except ValueError:
+        return
+    if not 1 < num_tokens <= max_t:
+        return
+    counts = getattr(_qwen35_0diff_moe_sub_dump, "_counts", 0)
+    _qwen35_0diff_moe_sub_dump._counts = counts + 1
+    payload = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in tensors.items()}
+    torch.save(payload, os.path.join(dump_dir, f"moesub_call{counts}.pt"))
 
 
 def register_layer_for_moe_forward_op(
@@ -819,6 +844,17 @@ class MoERunner(MoERunnerInterface):
         shared_output, fused_output = self._maybe_apply_routed_scale_to_output(
             shared_output, fused_output
         )
+
+        # qwen35-0diff: capture the exact combine operands.
+        if "VLLM_MOE_SUB_DUMP_DIR" in os.environ:
+            _qwen35_0diff_moe_sub_dump(
+                hidden_states.shape[0],
+                {
+                    "shared_out": shared_output,
+                    "fused_out": fused_output,
+                    "num_tokens": hidden_states.shape[0],
+                },
+            )
 
         # Apply output transform (e.g. latent -> full dim)
         fused_output = self.apply_routed_output_transform(fused_output)

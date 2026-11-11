@@ -28,6 +28,7 @@
 from collections.abc import Iterable
 from itertools import islice
 from typing import Any
+import os
 
 import torch
 import torch.nn.functional as F
@@ -116,10 +117,46 @@ class Qwen2MoeMLP(nn.Module):
     def forward(self, x):
         gate_up, _ = self.gate_up_proj(x)
         out = maybe_fused_act_quant(self.act_fn, gate_up, self.down_proj)
+        act_out = out
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
-            out = F.sigmoid(self.expert_gate(x)[0]) * out
+            gate_logits = self.expert_gate(x)[0]
+            out = F.sigmoid(gate_logits) * out
+
+        # qwen35-0diff (branch qwen35-0diff-gdn-fla): env-gated capture of the
+        # shared-expert sub-boundaries for bitwise attribution (C3).  When the
+        # gate is None the final MLPs (dense path) are captured with the same
+        # key namespace; the dump filter excludes warmup by token count.
+        if _VLLM_QWEN35_0DIFF_SHARED_DUMP_DIR := os.environ.get(
+            "VLLM_SHARED_DUMP_DIR"
+        ):
+            num_tokens = x.shape[0]
+            if 1 < num_tokens <= 2048:
+                counts = getattr(Qwen2MoeMLP.forward, "_0diff_counts", 0)
+                Qwen2MoeMLP.forward._0diff_counts = counts + 1
+                torch.save(
+                    {
+                        "x": x.detach().clone(),
+                        "gate_up": gate_up.detach().clone(),
+                        "act_out": (
+                            act_out.detach().clone()
+                            if torch.is_tensor(act_out)
+                            else None
+                        ),
+                        "down_out": out.detach().clone(),
+                        "gate_logits": (
+                            gate_logits.detach().clone()
+                            if self.expert_gate is not None
+                            else None
+                        ),
+                        "final": out.detach().clone(),
+                        "num_tokens": num_tokens,
+                    },
+                    os.path.join(
+                        _VLLM_QWEN35_0DIFF_SHARED_DUMP_DIR, f"shared_call{counts}.pt"
+                    ),
+                )
 
         return out
 

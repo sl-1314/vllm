@@ -4,6 +4,7 @@
 
 from collections.abc import Iterable
 from itertools import islice
+import os
 
 import torch
 from torch import nn
@@ -134,6 +135,30 @@ def _should_replicate_misaligned_shared_expert(
         f"the OCP MX group size {group_size}. Choose a compatible "
         "tensor-parallel size or enable expert parallelism."
     )
+
+
+def _qwen35_0diff_moe_dump(num_tokens: int, tensors: dict) -> None:
+    """qwen35-0diff (branch qwen35-0diff-gdn-fla): env-gated in-engine capture
+    of MoE sub-boundary tensors (experts output before the shared-expert add,
+    shared-expert output, combined output) for expert-path attribution (C3).
+
+    Instrumentation only — no numerics changes.  Warmup/dummy forwards are
+    excluded by the same token-count window as the layer capture.
+    """
+    dump_dir = os.environ.get("VLLM_MOE_DUMP_DIR")
+    if not dump_dir:
+        return
+    try:
+        max_t = int(os.environ.get("VLLM_MOE_DUMP_MAX_T", "2048"))
+    except ValueError:
+        return
+    if not 1 < num_tokens <= max_t:
+        return
+    counts = getattr(_qwen35_0diff_moe_dump, "_counts", 0)
+    _qwen35_0diff_moe_dump._counts = counts + 1
+    payload = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in tensors.items()}
+    path = os.path.join(dump_dir, f"moe_call{counts}.pt")
+    torch.save(payload, path)
 
 
 class Qwen3NextSparseMoeBlock(nn.Module):
@@ -275,6 +300,25 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         )
         if replicated_shared_output is not None:
             final_hidden_states += replicated_shared_output
+
+        # qwen35-0diff: sub-boundary capture for expert-path attribution.
+        if os.environ.get("VLLM_MOE_DUMP_DIR"):
+            _qwen35_0diff_moe_dump(
+                num_tokens,
+                {
+                    "hidden_states": hidden_states,
+                    "experts_out": final_hidden_states,
+                    "shared_out": (
+                        replicated_shared_output
+                        if replicated_shared_output is not None
+                        else None
+                    ),
+                    "final_out": final_hidden_states,
+                    "num_tokens": num_tokens,
+                    "replicate_shared_expert": self.replicate_shared_expert,
+                    "fused_shared_expert": self.is_fused_shared_expert_enabled,
+                },
+            )
 
         if self.is_sequence_parallel and not already_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
