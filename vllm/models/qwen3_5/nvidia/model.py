@@ -24,6 +24,8 @@
 # limitations under the License.
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
+import os
+
 from collections.abc import Iterable
 from itertools import islice
 from typing import ClassVar, cast
@@ -136,6 +138,34 @@ from .ops.fused_norm_quant import (
 )
 
 logger = init_logger(__name__)
+
+
+def _qwen35_0diff_layer_dump(layer_idx: int, num_tokens: int, tensors: dict) -> None:
+    """qwen35-0diff (branch qwen35-0diff-gdn-fla): env-gated in-engine capture of
+    decoder-layer sub-boundary tensors for cross-framework op attribution (C3).
+
+    The NVIDIA-vendor implementation is the one that actually executes on SM90
+    (the generic model_executor copy is dead code for this platform), so the
+    capture hooks live here.  Warmup/dummy forwards are excluded by a token-count
+    ceiling (real scoring batches are far below max_num_batched_tokens).
+    """
+    dump_dir = os.environ.get("VLLM_LAYER_DUMP_DIR")
+    if not dump_dir:
+        return
+    try:
+        want_layers = {int(x) for x in os.environ.get("VLLM_LAYER_DUMP_LAYERS", "0").split(",") if x}
+        max_t = int(os.environ.get("VLLM_LAYER_DUMP_MAX_T", "2048"))
+    except ValueError:
+        return
+    if layer_idx not in want_layers or not (1 < num_tokens <= max_t):
+        return
+    counts = getattr(_qwen35_0diff_layer_dump, "_counts", {})
+    cnt = counts.get(layer_idx, 0)
+    counts[layer_idx] = cnt + 1
+    _qwen35_0diff_layer_dump._counts = counts
+    payload = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in tensors.items()}
+    path = os.path.join(dump_dir, f"layer{layer_idx:02d}_call{cnt}.pt")
+    torch.save(payload, path)
 
 
 def _norm_quant_key(linear: nn.Module) -> QuantKey | None:
@@ -420,6 +450,16 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         if self.use_attn_reduce_scatter_for_moe:
             return super().forward(hidden_states, residual, positions, **kwargs)
 
+        # qwen35-0diff: clone before the fused (in-place) norms.
+        _0diff_h_in = (
+            hidden_states.detach().clone() if os.environ.get("VLLM_LAYER_DUMP_DIR") else None
+        )
+        _0diff_res_in = (
+            residual.detach().clone()
+            if os.environ.get("VLLM_LAYER_DUMP_DIR") and residual is not None
+            else None
+        )
+
         # Each norm absorbs the preceding row-parallel linear's deferred
         # all-reduce (reduce_inputs) and quantizes for its consumer when it
         # can. layer_scale commutes with the deferred all-reduce.
@@ -432,6 +472,11 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
             in_proj,
             write_y=is_gdn,
         )
+        if _0diff_h_in is not None:
+            _0diff_h_post_ln = hidden_states.detach().clone()
+            _0diff_proj_in = (
+                in_proj_input.detach().clone() if in_proj_input is not None else None
+            )
         if is_gdn:
             hidden_states = self.linear_attn.forward_cuda(
                 hidden_states, qkvz_input=in_proj_input
@@ -441,6 +486,8 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 hidden_states=hidden_states if in_proj_input is None else in_proj_input,
                 positions=positions,
             )
+        if _0diff_h_in is not None:
+            _0diff_h_post_attn = hidden_states.detach().clone()
 
         if self.layer_scale:
             if len(hidden_states.shape) == 2:
@@ -459,6 +506,11 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 hidden_states, residual, gate_up
             )
         )
+        if _0diff_h_in is not None:
+            _0diff_h_pre_moe = (
+                (mlp_input if mlp_input is not None else hidden_states).detach().clone()
+            )
+            _0diff_res_moe = residual.detach().clone()
         hidden_states = self.mlp(hidden_states if mlp_input is None else mlp_input)
 
         if self.layer_scale:
@@ -474,6 +526,23 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 hidden_states = hidden_states * (
                     self.ffn_layer_scale.to(hidden_states.dtype) + 1
                 )
+
+        if _0diff_h_in is not None:
+            _qwen35_0diff_layer_dump(
+                self.layer_idx,
+                _0diff_h_in.shape[0],
+                {
+                    "h_in": _0diff_h_in,
+                    "res_in": _0diff_res_in,
+                    "h_post_ln": _0diff_h_post_ln,
+                    "proj_in": _0diff_proj_in,
+                    "h_post_attn": _0diff_h_post_attn,
+                    "h_pre_moe": _0diff_h_pre_moe,
+                    "res_moe": _0diff_res_moe,
+                    "h_out": hidden_states.detach().clone(),
+                    "num_tokens": _0diff_h_in.shape[0],
+                },
+            )
 
         return hidden_states, residual
 

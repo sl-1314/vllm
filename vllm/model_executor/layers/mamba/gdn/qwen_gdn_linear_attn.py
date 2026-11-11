@@ -117,6 +117,33 @@ from vllm.v1.attention.backends.gdn_attn import (
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
+
+def _qwen35_0diff_gdn_dump(num_tokens: int, tensors: dict) -> None:
+    """qwen35-0diff (branch qwen35-0diff-gdn-fla): env-gated in-engine capture of
+    GDN prefill sub-boundary tensors (conv in/out, post-conv-prep q/k/v/g/beta,
+    chunk-kernel core output) for cross-framework op attribution (C3).  Only the
+    prefill branch calls this; the token-count gate keeps warmup/decode forwards
+    out.  One file per eligible forward, named by a global call counter (layers
+    execute in order, so call N corresponds to GDN layer N).
+    """
+    dump_dir = os.environ.get("VLLM_GDN_DUMP_DIR")
+    if not dump_dir:
+        return
+    try:
+        # Exclude warmup/dummy forwards (max_num_batched_tokens-sized) and
+        # single-token decode steps; real scoring prefills sit in between.
+        # Exact-T gating proved fragile (prefill batches may be padded).
+        max_t = int(os.environ.get("VLLM_GDN_DUMP_MAX_T", "2048"))
+    except ValueError:
+        return
+    if not (1 < num_tokens <= max_t):
+        return
+    cnt = getattr(_qwen35_0diff_gdn_dump, "_cnt", 0)
+    _qwen35_0diff_gdn_dump._cnt = cnt + 1
+    payload = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in tensors.items()}
+    path = os.path.join(dump_dir, f"gdn_call{cnt}.pt")
+    torch.save(payload, path)
+
 # Optional ROCm AITER Triton kernels for the GDN decode path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
 # references are imported here so that they can be called without per-call
@@ -1813,6 +1840,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out: Pre-allocated output buffer for attention results.
 
         """
+        # qwen35-0diff debug: entry trace for the custom-op dispatch question.
+        _dbg = os.environ.get("VLLM_LAYER_DUMP_DEBUG")
+        if _dbg:
+            with open(_dbg, "a") as fh:
+                fh.write(f"gdn-core enter T={mixed_qkv.shape[0]}\n")
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
 
@@ -1920,6 +1952,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 query_start_loc=non_spec_query_start_loc,
                 metadata=attn_metadata,
             ).transpose(0, 1)
+            # qwen35-0diff: stash prefill conv in/out for the layer dump below.
+            _0diff_conv_io = (
+                (conv_input_non_spec, mixed_qkv_non_spec, conv_weights)
+                if os.environ.get("VLLM_GDN_DUMP_DIR")
+                else None
+            )
         elif attn_metadata.num_decodes > 0:
             assert mixed_qkv_non_spec is not None
             mixed_qkv_non_spec = causal_conv1d_update(
@@ -1989,6 +2027,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             value_non_spec = value_non_spec.unsqueeze(0)
             g_non_spec = g_non_spec.unsqueeze(0)
             beta_non_spec = beta_non_spec.unsqueeze(0)
+            # qwen35-0diff: stash post-conv-prep tensors for the layer dump below.
+            _0diff_prep = (
+                (a_prefill, b_prefill)
+                if os.environ.get("VLLM_GDN_DUMP_DIR")
+                else None
+            )
         else:
             query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
                 mixed_qkv_non_spec
@@ -2101,6 +2145,29 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     use_qk_l2norm_in_kernel=False,
                     aiter_prefill_metadata=attn_metadata.aiter_prefill_metadata,
                 )
+            # qwen35-0diff: in-engine GDN prefill sub-boundary capture (see
+            # _qwen35_0diff_gdn_dump). Runs after the chunk/flashinfer core
+            # so all three capture points (conv, prep, core) land in one file.
+            if os.environ.get("VLLM_GDN_DUMP_DIR") and _0diff_conv_io is not None:
+                _conv_in, _conv_out, _conv_w = _0diff_conv_io
+                _a_prefill, _b_prefill = _0diff_prep
+                _qwen35_0diff_gdn_dump(
+                    _conv_in.shape[0],
+                    {
+                        "conv_in": _conv_in,
+                        "conv_out": _conv_out,
+                        "conv_weight": _conv_w,
+                        "q": query_non_spec,
+                        "k": key_non_spec,
+                        "v": value_non_spec,
+                        "g": g_non_spec,
+                        "beta": beta_non_spec,
+                        "a": _a_prefill,
+                        "b": _b_prefill,
+                        "core_attn_out": core_attn_out_non_spec,
+                    },
+                )
+
             # Init cache
             scatter_states(ssm_state, last_recurrent_state, prefill_state_indices)
 

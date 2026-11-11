@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
+
 from collections.abc import Callable
 
 import torch
@@ -260,5 +262,26 @@ class FusedTopKRouter(BaseRouter):
             indices_type=indices_type,
             scoring_func=self.scoring_func,
         )
+
+        # qwen35-0diff (branch qwen35-0diff-gdn-fla): env-gated capture of the
+        # real in-engine routing (gate logits + top-k result) for cross-
+        # framework router-parity analysis (C3). Excludes warmup/decode-sized
+        # forwards by token count.
+        _dump_dir = os.environ.get("VLLM_MOE_DUMP_DIR")
+        if _dump_dir and 1 < hidden_states.shape[0] <= int(
+            os.environ.get("VLLM_MOE_DUMP_MAX_T", "2048")
+        ):
+            cnt = getattr(FusedTopKRouter, "_0diff_cnt", 0)
+            FusedTopKRouter._0diff_cnt = cnt + 1
+            torch.save(
+                {
+                    "hidden_states": hidden_states.detach().clone(),
+                    "router_logits": router_logits.detach().clone(),
+                    "topk_weights": topk_weights.detach().clone(),
+                    "topk_ids": topk_ids.detach().clone(),
+                    "num_tokens": hidden_states.shape[0],
+                },
+                os.path.join(_dump_dir, f"moe_call{cnt}.pt"),
+            )
 
         return topk_weights, topk_ids
