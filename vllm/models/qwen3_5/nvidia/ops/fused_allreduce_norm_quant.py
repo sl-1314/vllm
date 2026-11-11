@@ -15,6 +15,7 @@ then runs an explicit all-reduce and the Triton norm-quant.
 
 import torch
 
+from vllm import envs
 from vllm.config.compilation import PassConfig
 from vllm.distributed.device_communicators import flashinfer_all_reduce as fi_ar
 from vllm.distributed.parallel_state import (
@@ -46,6 +47,12 @@ def _get_workspace(hidden_states: torch.Tensor, tp_size: int):
     None."""
     global _workspace_unsupported
     if not fi_ar.fi_ar_available or _workspace_unsupported:
+        return None
+    if envs.VLLM_BATCH_INVARIANT:
+        # The trtllm fused allreduce picks its oneshot/twoshot route from the
+        # token count, so the per-element summation order across ranks varies
+        # with the batch size. See fused_allreduce_gemma_rms_norm for the
+        # non-quant path.
         return None
     if (
         not hidden_states.is_cuda
