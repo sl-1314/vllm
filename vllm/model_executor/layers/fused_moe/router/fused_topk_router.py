@@ -266,8 +266,12 @@ class FusedTopKRouter(BaseRouter):
         # qwen35-0diff (branch qwen35-0diff-gdn-fla): env-gated capture of the
         # real in-engine routing (gate logits + top-k result) for cross-
         # framework router-parity analysis (C3). Excludes warmup/decode-sized
-        # forwards by token count.
-        _dump_dir = os.environ.get("VLLM_MOE_DUMP_DIR")
+        # forwards by token count.  VLLM_ROUTER_DUMP_DIR (not VLLM_MOE_DUMP_DIR
+        # — that name collides with the qwen3_next sparse-block hook's
+        # moe_call{N}.pt files).
+        _dump_dir = os.environ.get("VLLM_ROUTER_DUMP_DIR") or os.environ.get(
+            "VLLM_MOE_DUMP_DIR"
+        )
         if _dump_dir and 1 < hidden_states.shape[0] <= int(
             os.environ.get("VLLM_MOE_DUMP_MAX_T", "2048")
         ):
