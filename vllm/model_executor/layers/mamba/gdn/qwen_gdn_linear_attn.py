@@ -74,9 +74,23 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
-from vllm.third_party.flash_linear_attention.ops import (
-    chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
-)
+# 0-diff (qwen35-0diff-gdn-fla): import the SAME fla package the mlite
+# trainer calls (source-installed flash-linear-attention) instead of the
+# in-tree vendored copy, so both sides run bit-identical GDN chunk kernels.
+# The vendored copy is an older fla generation (split chunk_o/chunk_delta_h
+# layout) and diverges from fla.ops.gated_delta_rule numerically.
+try:
+    from fla.ops.gated_delta_rule import (
+        chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
+    )
+
+    _FLA_SAME_SOURCE = True
+except ImportError:
+    from vllm.third_party.flash_linear_attention.ops import (
+        chunk_gated_delta_rule as fla_chunk_gated_delta_rule,
+    )
+
+    _FLA_SAME_SOURCE = False
 from vllm.third_party.flash_linear_attention.ops import (
     fused_post_conv_prep,
     fused_recurrent_gated_delta_rule_packed_decode,
@@ -534,6 +548,24 @@ class ChunkGatedDeltaRule(CustomOp):
         core_attn_out: torch.Tensor | None = None,
         aiter_prefill_metadata: object | None = None,
     ):
+        if _FLA_SAME_SOURCE:
+            # fla 0.6 computes chunk indices from cu_seqlens internally; the
+            # vLLM-metadata chunk_indices/chunk_offsets follow the vendored
+            # (older) fla convention and are NOT passed through.
+            # NOTE: initial/final state layout differs (vLLM [N,H,V,K] vs fla
+            # [N,H,K,V]); harmless for fresh-state prefill (zeros either way),
+            # must be revisited for cache-resumed prefill.
+            return fla_chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+                cu_seqlens=cu_seqlens,
+            )
         return fla_chunk_gated_delta_rule(
             q=q,
             k=k,
