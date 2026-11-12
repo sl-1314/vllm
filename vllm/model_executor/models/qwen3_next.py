@@ -157,7 +157,16 @@ def _qwen35_0diff_moe_dump(num_tokens: int, tensors: dict) -> None:
     counts = getattr(_qwen35_0diff_moe_dump, "_counts", 0)
     _qwen35_0diff_moe_dump._counts = counts + 1
     payload = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in tensors.items()}
-    path = os.path.join(dump_dir, f"moe_call{counts}.pt")
+    # qwen35-0diff: rank-tag the dump at TP>1 (instrumentation only).
+    rank_tag = ""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            rank_tag = f"_r{dist.get_rank()}"
+    except Exception:
+        rank_tag = ""
+    path = os.path.join(dump_dir, f"moe_call{counts}{rank_tag}.pt")
     torch.save(payload, path)
 
 
@@ -317,6 +326,38 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                     "num_tokens": num_tokens,
                     "replicate_shared_expert": self.replicate_shared_expert,
                     "fused_shared_expert": self.is_fused_shared_expert_enabled,
+                    # qwen35-0diff: TP-sharded expert weights (routed
+                    # w13/w2 + folded shared expert) and router gate weight,
+                    # on the first eligible call only (instrumentation;
+                    # weights are call-invariant, large tensors).
+                    "expert_params": (
+                        {
+                            n: p.detach().clone()
+                            for n, p in self.experts.named_parameters()
+                        }
+                        if (
+                            os.environ.get("VLLM_MOE_DUMP_WEIGHTS")
+                            and getattr(
+                                _qwen35_0diff_moe_dump, "_counts", 0
+                            )
+                            == 0
+                        )
+                        else None
+                    ),
+                    "gate_params": (
+                        {
+                            n: p.detach().clone()
+                            for n, p in self.gate.named_parameters()
+                        }
+                        if (
+                            os.environ.get("VLLM_MOE_DUMP_WEIGHTS")
+                            and getattr(
+                                _qwen35_0diff_moe_dump, "_counts", 0
+                            )
+                            == 0
+                        )
+                        else None
+                    ),
                 },
             )
 

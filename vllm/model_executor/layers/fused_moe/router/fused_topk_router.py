@@ -277,6 +277,15 @@ class FusedTopKRouter(BaseRouter):
         ):
             cnt = getattr(FusedTopKRouter, "_0diff_cnt", 0)
             FusedTopKRouter._0diff_cnt = cnt + 1
+            # qwen35-0diff: rank-tag at TP>1 (instrumentation only).
+            _rank_tag = ""
+            try:
+                import torch.distributed as dist
+
+                if dist.is_available() and dist.is_initialized():
+                    _rank_tag = f"_rr{dist.get_rank()}"
+            except Exception:
+                _rank_tag = ""
             torch.save(
                 {
                     "hidden_states": hidden_states.detach().clone(),
@@ -285,7 +294,9 @@ class FusedTopKRouter(BaseRouter):
                     "topk_ids": topk_ids.detach().clone(),
                     "num_tokens": hidden_states.shape[0],
                 },
-                os.path.join(_dump_dir, f"moe_call{cnt}.pt"),
+                os.path.join(
+                    _dump_dir, f"router_call{cnt}{_rank_tag}.pt"
+                ),
             )
 
         return topk_weights, topk_ids

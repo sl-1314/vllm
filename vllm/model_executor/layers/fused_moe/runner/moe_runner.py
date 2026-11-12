@@ -85,7 +85,18 @@ def _qwen35_0diff_moe_sub_dump(num_tokens: int, tensors: dict) -> None:
     counts = getattr(_qwen35_0diff_moe_sub_dump, "_counts", 0)
     _qwen35_0diff_moe_sub_dump._counts = counts + 1
     payload = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in tensors.items()}
-    torch.save(payload, os.path.join(dump_dir, f"moesub_call{counts}.pt"))
+    # qwen35-0diff: rank-tag the dump at TP>1 (instrumentation only).
+    rank_tag = ""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            rank_tag = f"_r{dist.get_rank()}"
+    except Exception:
+        rank_tag = ""
+    torch.save(
+        payload, os.path.join(dump_dir, f"moesub_call{counts}{rank_tag}.pt")
+    )
 
 
 def register_layer_for_moe_forward_op(
