@@ -3,8 +3,55 @@
 # Copyright (c) 2023, Tri Dao.
 # ruff: noqa: E501
 
+import os
 
 import torch
+
+
+def _fa_0diff_dump(tag: str, payload: dict) -> None:
+    """qwen35-0diff (branch qwen35-0diff-gdn-fla): env-gated capture of FA
+    kernel in/out tensors for cross-framework op attribution (C3 FA alignment).
+
+    Instrumentation only -- no numerics are touched.  Warmup/dummy forwards are
+    excluded by a token-count ceiling, same filter as the layer dump hook.
+    """
+    dump_dir = os.environ.get("VLLM_FA_DUMP_DIR")
+    if not dump_dir:
+        return
+    try:
+        max_t = int(os.environ.get("VLLM_FA_DUMP_MAX_T", "2048"))
+        min_t = int(os.environ.get("VLLM_FA_DUMP_MIN_T", "2"))
+    except ValueError:
+        return
+    ntok = payload.get("num_tokens")
+    if ntok is None or not (min_t <= ntok <= max_t):
+        return
+    counts = getattr(_fa_0diff_dump, "_counts", {})
+    cnt = counts.get(tag, 0)
+    counts[tag] = cnt + 1
+    _fa_0diff_dump._counts = counts
+    safe = {key: (val.detach().clone() if torch.is_tensor(val) else val)
+            for key, val in payload.items()}
+    torch.save(safe, os.path.join(dump_dir, f"{tag}_call{cnt}.pt"))
+
+
+def _fa_0diff_gather_paged_kv(k, v, block_table, seqused_k):
+    """Gather the batch's own (mapped) KV blocks out of the paged cache.
+
+    The whole-pool tensors are VMM-backed with on-demand page mapping, so
+    cloning them reads unmapped pages (CUDA illegal access, seen in the first
+    dump attempts).  Only the blocks referenced by block_table are mapped --
+    the attention kernel just read them.
+    """
+    page = k.shape[1]
+    ks, vs = [], []
+    for i in range(int(seqused_k.shape[0])):
+        n = int(seqused_k[i])
+        nb = (n + page - 1) // page
+        idx = block_table[i, :nb].to(torch.long)
+        ks.append(k[idx].reshape(-1, *k.shape[2:])[:n])
+        vs.append(v[idx].reshape(-1, *v.shape[2:])[:n])
+    return torch.cat(ks, dim=0), torch.cat(vs, dim=0)
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
@@ -512,6 +559,42 @@ def flash_attn_varlen_func(
         )
     else:
         raise ValueError(f"Unsupported FA version: {fa_version}")
+    if os.environ.get("VLLM_FA_DUMP_DIR") and q.shape[0] > 1:
+        # Paged path: k/v are views of the VMM-backed KV pool -- gather the
+        # batch's own blocks instead of cloning the whole pool.  Dense path
+        # (cu_seqlens_k given): k/v are small per-token tensors, clone them.
+        if block_table is not None and seqused_k is not None:
+            k_dump, v_dump = _fa_0diff_gather_paged_kv(k, v, block_table, seqused_k)
+            paged = True
+        else:
+            k_dump, v_dump = k, v
+            paged = False
+        _fa_0diff_dump(
+            "varlen",
+            {
+                "num_tokens": q.shape[0],
+                "q": q,
+                "k": k_dump,
+                "v": v_dump,
+                "out": out,
+                "cu_seqlens_q": cu_seqlens_q,
+                "cu_seqlens_k": cu_seqlens_k,
+                "seqused_k": seqused_k,
+                "block_table": block_table,
+                "page_size": (k.shape[1] if block_table is not None else None),
+                "paged": paged,
+                "k_pool_shape": tuple(k.shape),
+                "max_seqlen_q": max_seqlen_q,
+                "max_seqlen_k": max_seqlen_k,
+                "softmax_scale": softmax_scale,
+                "causal": causal,
+                "window_size": window_size,
+                "softcap": softcap,
+                "num_splits": num_splits,
+                "scheduler_metadata": scheduler_metadata,
+                "fa_version": fa_version,
+            },
+        )
     return (out, softmax_lse) if return_softmax_lse else out
 
 

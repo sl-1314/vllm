@@ -8,9 +8,35 @@ NeoX-style partial RoPE). The unfused reference sequence is
 single Triton launch. See `fused_qk_rmsnorm_rope_gate`.
 """
 
+import os
+
 import torch
 
 from vllm.triton_utils import tl, triton
+
+
+def _fa_0diff_dump(payload: dict) -> None:
+    """qwen35-0diff (branch qwen35-0diff-gdn-fla): env-gated capture of this
+    kernel's inputs/outputs (VLLM_FA_DUMP_DIR).  Instrumentation only; also
+    proves at runtime which (fused vs eager) branch actually executed."""
+    dump_dir = os.environ.get("VLLM_FA_DUMP_DIR")
+    if not dump_dir:
+        return
+    try:
+        max_t = int(os.environ.get("VLLM_FA_DUMP_MAX_T", "2048"))
+        min_t = int(os.environ.get("VLLM_FA_DUMP_MIN_T", "2"))
+    except ValueError:
+        return
+    ntok = payload["q_gate"].shape[0]
+    if not (min_t <= ntok <= max_t):
+        return
+    counts = getattr(_fa_0diff_dump, "_counts", {})
+    cnt = counts.get("qk_rope_gate", 0)
+    counts["qk_rope_gate"] = cnt + 1
+    _fa_0diff_dump._counts = counts
+    safe = {key: (val.detach().clone() if torch.is_tensor(val) else val)
+            for key, val in payload.items()}
+    torch.save(safe, os.path.join(dump_dir, f"qk_rope_gate_call{cnt}.pt"))
 
 
 @triton.jit
@@ -276,5 +302,25 @@ def fused_qk_rmsnorm_rope_gate(
         MROPE_SECTION_W=mrope_section_w,
         num_warps=num_warps,
         num_stages=2,
+    )
+    _fa_0diff_dump(
+        {
+            "q_gate": q_gate,
+            "k": k,
+            "q_weight": q_weight,
+            "k_weight": k_weight,
+            "cos_sin_cache": cos_sin_cache,
+            "positions": positions,
+            "eps": eps,
+            "num_q_heads": num_q_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+            "rotary_dim": rotary_dim,
+            "mrope_section": mrope_section,
+            "norm_beta": norm_beta,
+            "q_out": q_out,
+            "k_out": k_out,
+            "gate_out": gate_out,
+        }
     )
     return q_out, k_out, gate_out

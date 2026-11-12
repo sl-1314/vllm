@@ -2,10 +2,37 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Fused sigmoid-gate-multiply Triton kernel: `out = x * sigmoid(gate)`."""
 
+import os
+
 import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+
+
+def _fa_0diff_dump(path: str, x: torch.Tensor, gate: torch.Tensor, out: torch.Tensor) -> None:
+    """qwen35-0diff (branch qwen35-0diff-gdn-fla): env-gated capture of this
+    kernel's in/out (VLLM_FA_DUMP_DIR); `path` records triton vs eager."""
+    dump_dir = os.environ.get("VLLM_FA_DUMP_DIR")
+    if not dump_dir:
+        return
+    try:
+        max_t = int(os.environ.get("VLLM_FA_DUMP_MAX_T", "2048"))
+        min_t = int(os.environ.get("VLLM_FA_DUMP_MIN_T", "2"))
+    except ValueError:
+        return
+    ntok = x.shape[0] if x.ndim == 2 else -1
+    if not (min_t <= ntok <= max_t):
+        return
+    counts = getattr(_fa_0diff_dump, "_counts", {})
+    cnt = counts.get(path, 0)
+    counts[path] = cnt + 1
+    _fa_0diff_dump._counts = counts
+    torch.save(
+        {"x": x.detach().clone(), "gate": gate.detach().clone(),
+         "out": out.detach().clone(), "path": path},
+        os.path.join(dump_dir, f"sigmoid_gate_{path}_call{cnt}.pt"),
+    )
 
 
 @triton.jit
@@ -70,6 +97,7 @@ def fused_sigmoid_gate_mul(
     ):
         out = x * torch.sigmoid(gate)
         if scale is None:
+            _fa_0diff_dump("eager", x, gate, out)
             return out
         # Strided gate view (num_heads == 1 per TP rank): quantize the eager
         # result, matching the unfused chain.
@@ -106,4 +134,5 @@ def fused_sigmoid_gate_mul(
         QUANT_FP8=scale is not None,
         num_warps=num_warps,
     )
+    _fa_0diff_dump("triton", x, gate, out)
     return out

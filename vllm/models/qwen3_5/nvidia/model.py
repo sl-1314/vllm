@@ -155,9 +155,10 @@ def _qwen35_0diff_layer_dump(layer_idx: int, num_tokens: int, tensors: dict) -> 
     try:
         want_layers = {int(x) for x in os.environ.get("VLLM_LAYER_DUMP_LAYERS", "0").split(",") if x}
         max_t = int(os.environ.get("VLLM_LAYER_DUMP_MAX_T", "2048"))
+        min_t = int(os.environ.get("VLLM_LAYER_DUMP_MIN_T", "2"))
     except ValueError:
         return
-    if layer_idx not in want_layers or not (1 < num_tokens <= max_t):
+    if layer_idx not in want_layers or not (min_t <= num_tokens <= max_t):
         return
     counts = getattr(_qwen35_0diff_layer_dump, "_counts", {})
     cnt = counts.get(layer_idx, 0)
