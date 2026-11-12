@@ -163,7 +163,17 @@ def _qwen35_0diff_gdn_dump(num_tokens: int, tensors: dict) -> None:
     cnt = getattr(_qwen35_0diff_gdn_dump, "_cnt", 0)
     _qwen35_0diff_gdn_dump._cnt = cnt + 1
     payload = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in tensors.items()}
-    path = os.path.join(dump_dir, f"gdn_call{cnt}.pt")
+    # qwen35-0diff: rank-tag the dump at TP>1 so per-rank shards don't
+    # clobber each other (instrumentation only).
+    rank_tag = ""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            rank_tag = f"_r{dist.get_rank()}"
+    except Exception:
+        rank_tag = ""
+    path = os.path.join(dump_dir, f"gdn_call{cnt}{rank_tag}.pt")
     torch.save(payload, path)
 
 # Optional ROCm AITER Triton kernels for the GDN decode path.

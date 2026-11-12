@@ -165,7 +165,17 @@ def _qwen35_0diff_layer_dump(layer_idx: int, num_tokens: int, tensors: dict) -> 
     counts[layer_idx] = cnt + 1
     _qwen35_0diff_layer_dump._counts = counts
     payload = {k: (v.detach().clone() if torch.is_tensor(v) else v) for k, v in tensors.items()}
-    path = os.path.join(dump_dir, f"layer{layer_idx:02d}_call{cnt}.pt")
+    # qwen35-0diff: rank-tag the dump at TP>1 so per-rank shards don't
+    # clobber each other (instrumentation only).
+    rank_tag = ""
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            rank_tag = f"_r{dist.get_rank()}"
+    except Exception:
+        rank_tag = ""
+    path = os.path.join(dump_dir, f"layer{layer_idx:02d}_call{cnt}{rank_tag}.pt")
     torch.save(payload, path)
 
 
