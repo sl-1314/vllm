@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import torch
 
+from vllm import envs
 from vllm.third_party.flash_linear_attention.ops.layernorm_guard import (
     calc_rows_per_block,
 )
@@ -115,7 +116,21 @@ def fused_gdn_gated_rms_norm(
     if num_tokens == 0:
         return
     block_n = triton.next_power_of_2(head_v_dim)
-    rows_per_block = calc_rows_per_block(num_tokens, x.device)
+    if envs.VLLM_BATCH_INVARIANT:
+        # calc_rows_per_block keys the Triton tile shape (ROWS_PER_BLOCK is a
+        # constexpr) off the token count: next_power_of_2(cdiv(M, 2*SM)) capped
+        # at 4, so the tile -- and with it the axis-1 reduction layout and its
+        # fp32 rounding -- switches at M = 2*SM+1 (157 on a 78-SM part).
+        # Identical inputs then yield different outputs across forward
+        # lengths (a partial-prefix forward vs a full-sequence re-score of
+        # the same rows). Pin the largest tile so every forward length
+        # compiles one row-invariant variant; masked tail rows contribute
+        # zeros and each row's reduction tree is fixed by the tile shape,
+        # not by M or the grid. 4 is also the variant the unpinned kernel
+        # picks for M >= 4*SM+1, the regime of full-sequence forwards.
+        rows_per_block = 4
+    else:
+        rows_per_block = calc_rows_per_block(num_tokens, x.device)
     grid = (triton.cdiv(num_tokens, rows_per_block), num_v_heads)
     _fused_gdn_gated_rms_norm_kernel[grid](
         x,
