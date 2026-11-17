@@ -18,6 +18,8 @@ instead of embedding feature-specific logic directly.
 
 import functools
 import gc
+import json
+import os
 import time
 from collections.abc import Iterable
 from contextlib import AbstractContextManager
@@ -1451,9 +1453,60 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             decode_graph_eligible=decode_graph_eligible,
             max_seq_len_np=max_seq_len_np,
         )
+        self._log_batch_composition(batch_state)
         return batch_state, get_uniform_decode_token_count(
             num_reqs, num_toks, max_query_len, decode_graph_eligible
         )
+
+    def _log_batch_composition(self, batch_req_state: "BatchReqState") -> None:
+        """qwen35-0diff instrumentation (env-gated, inert by default).
+
+        When VLLM_BATCH_COMPOSITION_LOG names a file, append one JSON line
+        per scheduled forward recording the batch's ROW LAYOUT: request ids
+        in batch order with each row's scheduled token count, prefill offset
+        (tokens already computed before this forward), and prefill length.
+        NCCL's bf16 all-reduce is row-order-sensitive, so a trainer seeking
+        bitwise logprob parity with this engine at TP>1 must pack its
+        training batches in this exact per-forward row order (the C10
+        row-order contract); this log is the rollout-side authoritative
+        record of that order.  All TP ranks hold the identical scheduler
+        output, so only TP rank 0 writes; each record carries the writer's
+        engine rank for provenance.
+        """
+        path = os.environ.get("VLLM_BATCH_COMPOSITION_LOG")
+        if not path:
+            return
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            if get_tensor_model_parallel_rank() != 0:
+                return
+        except Exception:  # pragma: no cover - env-dependent
+            return
+        b = batch_req_state
+        rec = {
+            "engine_rank": torch.distributed.get_rank()
+            if torch.distributed.is_initialized()
+            else 0,
+            "num_tokens": int(b.num_tokens),
+            "rows": [
+                {
+                    "id": rid,
+                    "n": int(n),
+                    "computed": int(c),
+                    "plen": int(plen),
+                }
+                for rid, n, c, plen in zip(
+                    b.req_ids,
+                    b.num_scheduled_tokens,
+                    b.num_computed_prefill_tokens_np,
+                    b.prefill_len_np,
+                )
+            ],
+        }
+        line = json.dumps(rec) + "\n"
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
 
     def prepare_inputs(
         self,
