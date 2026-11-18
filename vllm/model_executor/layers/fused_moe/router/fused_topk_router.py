@@ -35,6 +35,23 @@ def vllm_topk_softmax(
         is_padding=get_moe_padding_mask(topk_indices.shape[0]),
     )
 
+    # qwen35-0diff (C13-B): env-gated instrumentation capturing the routing
+    # operands (gate logits + topk weights/ids) for the mlite router-contract
+    # bitwise audit.  Numerics are NOT touched: clone-only, after the kernel.
+    _dump_dir = os.environ.get("VLLM_TOPK_DUMP_DIR")
+    if _dump_dir:
+        _n = getattr(vllm_topk_softmax, "_dump_n", 0)
+        vllm_topk_softmax._dump_n = _n + 1
+        torch.save(
+            {
+                "gating_output": gating_output.detach().clone(),
+                "topk_weights": topk_weights.detach().clone(),
+                "topk_indices": topk_indices.detach().clone(),
+                "renormalize": renormalize,
+            },
+            os.path.join(_dump_dir, f"topk_call{_n}_r0.pt"),
+        )
+
     return topk_weights, topk_indices
 
 
