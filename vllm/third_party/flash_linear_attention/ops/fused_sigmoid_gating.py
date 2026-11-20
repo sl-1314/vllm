@@ -15,9 +15,11 @@ from vllm.triton_utils import tl, triton
 @triton.heuristics(
     {
         "USE_INITIAL_STATE": lambda args: args["h0"] is not None,
+        "HAS_INITIAL_STATE_MASK": lambda args: args["has_initial_state"] is not None,
         "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
         "IS_CONTINUOUS_BATCHING": lambda args: args["ssm_state_indices"] is not None,
         "IS_SPEC_DECODING": lambda args: args["num_accepted_tokens"] is not None,
+        "EXPORT_CHECKPOINTS": lambda args: args["checkpoint_state"] is not None,
     }
 )
 @triton.jit(do_not_specialize=["N", "T"])
@@ -37,6 +39,9 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     cu_seqlens,
     ssm_state_indices,
     num_accepted_tokens,
+    has_initial_state,
+    checkpoint_state,
+    checkpoint_offsets,
     scale,
     N: tl.int64,  # num of sequences
     T: tl.int64,  # num of tokens
@@ -51,12 +56,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     stride_final_state_token: tl.constexpr,
     stride_indices_seq: tl.constexpr,
     stride_indices_tok: tl.constexpr,
+    stride_ckpt_token: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,  # whether to use initial state
+    HAS_INITIAL_STATE_MASK: tl.constexpr,
     INPLACE_FINAL_STATE: tl.constexpr,  # whether to store final state inplace
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     IS_SPEC_DECODING: tl.constexpr,
+    EXPORT_CHECKPOINTS: tl.constexpr,
     IS_KDA: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -100,6 +108,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     mask_h = mask_v[:, None] & mask_k[None, :]
 
     b_h = tl.zeros([BV, BK], dtype=tl.float32)
+    seq_state_idx = tl.cast(0, tl.int64)
     if USE_INITIAL_STATE:
         if IS_CONTINUOUS_BATCHING:
             if IS_SPEC_DECODING:
@@ -107,17 +116,31 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             else:
                 i_t = 0
             # Load state index and check for invalid entries
-            state_idx = tl.load(ssm_state_indices + i_n * stride_indices_seq + i_t).to(
-                tl.int64
-            )
+            seq_state_idx = tl.load(
+                ssm_state_indices + i_n * stride_indices_seq + i_t
+            ).to(tl.int64)
             # Skip if state index is invalid (NULL_BLOCK_ID=0)
-            if state_idx <= 0:
+            if seq_state_idx <= 0:
                 return
-            p_h0 = h0 + state_idx * stride_init_state_token
+            load_init = True
+            if HAS_INITIAL_STATE_MASK:
+                load_init = tl.load(has_initial_state + i_n).to(tl.int1)
+            if load_init:
+                p_h0 = h0 + seq_state_idx * stride_init_state_token
+                p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+                b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
         else:
-            p_h0 = h0 + bos * HV * V * K
-        p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-        b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+            load_init = True
+            if HAS_INITIAL_STATE_MASK:
+                load_init = tl.load(has_initial_state + i_n).to(tl.int1)
+            if load_init:
+                p_h0 = h0 + bos * HV * V * K
+                p_h0 = p_h0 + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+                b_h += tl.load(p_h0, mask=mask_h, other=0).to(tl.float32)
+
+    ckpt_offset = tl.cast(0, tl.int64)
+    if EXPORT_CHECKPOINTS:
+        ckpt_offset = tl.load(checkpoint_offsets + i_n).to(tl.int64)
 
     for i_t in range(0, T):
         b_q = tl.load(p_q, mask=mask_k, other=0).to(tl.float32)
@@ -153,17 +176,34 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
         b_o = tl.sum(b_h * b_q[None, :], 1)
         tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
+        if EXPORT_CHECKPOINTS and ckpt_offset > 0:
+            if i_t == ckpt_offset - 1:
+                p_ckpt = (
+                    checkpoint_state
+                    + i_n * stride_ckpt_token
+                    + i_hv * V * K
+                    + o_v[:, None] * K
+                    + o_k[None, :]
+                )
+                tl.store(p_ckpt, b_h.to(p_ckpt.dtype.element_ty), mask=mask_h)
+
         # keep the states for multi-query tokens
         if INPLACE_FINAL_STATE:
-            # Load state index and check for invalid entries
-            final_state_idx = tl.load(
-                ssm_state_indices + i_n * stride_indices_seq + i_t
-            ).to(tl.int64)
-            # Only store if state index is valid (not NULL_BLOCK_ID=0)
-            if final_state_idx > 0:
-                p_ht = ht + final_state_idx * stride_final_state_token
-                p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
-                tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+            if IS_SPEC_DECODING:
+                # Load state index and check for invalid entries
+                final_state_idx = tl.load(
+                    ssm_state_indices + i_n * stride_indices_seq + i_t
+                ).to(tl.int64)
+                # Only store if state index is valid (not NULL_BLOCK_ID=0)
+                if final_state_idx > 0:
+                    p_ht = ht + final_state_idx * stride_final_state_token
+                    p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+                    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
+            else:
+                if i_t == T - 1 and seq_state_idx > 0:
+                    p_ht = ht + seq_state_idx * stride_final_state_token
+                    p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
+                    tl.store(p_ht, b_h.to(p_ht.dtype.element_ty), mask=mask_h)
         else:
             p_ht = ht + (bos + i_t) * stride_final_state_token
             p_ht = p_ht + i_hv * V * K + o_v[:, None] * K + o_k[None, :]
@@ -194,6 +234,9 @@ def fused_sigmoid_gating_delta_rule_update(
     cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
     num_accepted_tokens: torch.Tensor | None = None,
+    has_initial_state: torch.Tensor | None = None,
+    checkpoint_state: torch.Tensor | None = None,
+    checkpoint_offsets: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
     is_kda: bool = False,
 ):
@@ -238,6 +281,10 @@ def fused_sigmoid_gating_delta_rule_update(
     else:
         stride_indices_seq, stride_indices_tok = ssm_state_indices.stride()
 
+    stride_ckpt_token = (
+        checkpoint_state.stride(0) if checkpoint_state is not None else 0
+    )
+
     grid = (NK, NV, N * HV)
     fused_sigmoid_gating_delta_rule_update_kernel[grid](
         A_log=A_log,
@@ -255,6 +302,9 @@ def fused_sigmoid_gating_delta_rule_update(
         cu_seqlens=cu_seqlens,
         ssm_state_indices=ssm_state_indices,
         num_accepted_tokens=num_accepted_tokens,
+        has_initial_state=has_initial_state,
+        checkpoint_state=checkpoint_state,
+        checkpoint_offsets=checkpoint_offsets,
         scale=scale,
         N=N,
         T=T,
@@ -269,6 +319,7 @@ def fused_sigmoid_gating_delta_rule_update(
         stride_final_state_token=stride_final_state_token,
         stride_indices_seq=stride_indices_seq,
         stride_indices_tok=stride_indices_tok,
+        stride_ckpt_token=stride_ckpt_token,
         INPLACE_FINAL_STATE=inplace_final_state,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,

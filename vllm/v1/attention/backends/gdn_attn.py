@@ -93,6 +93,14 @@ class GDNAttentionBackend(AttentionBackend):
     def supports_device_cpu_query_lens_mismatch(cls) -> bool:
         return True
 
+    @classmethod
+    def supports_batch_invariance(cls) -> bool:
+        return True
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+
 
 @dataclass
 class GDNAttentionMetadata:
@@ -138,6 +146,10 @@ class GDNAttentionMetadata:
     nums_dict: dict | None = None
     batch_ptr: torch.Tensor | None = None
     token_chunk_offset_ptr: torch.Tensor | None = None
+
+    # For PCP: map gathered local tokens -> global order and global -> local order.
+    pcp_restore_idx: torch.Tensor | None = None
+    pcp_local_gather_idx: torch.Tensor | None = None
 
 
 class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]):

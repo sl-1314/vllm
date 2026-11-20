@@ -12,7 +12,10 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import async_tensor_h2d
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+from vllm.v1.attention.backends.gdn_attn import (
+    GDNAttentionMetadata,
+    GDNAttentionMetadataBuilder,
+)
 from vllm.v1.attention.backends.mamba2_attn import (
     Mamba2AttentionMetadata,
     Mamba2AttentionMetadataBuilder,
@@ -22,7 +25,7 @@ from vllm.v1.attention.backends.short_conv_attn import (
     ShortConvAttentionMetadataBuilder,
 )
 from vllm.v1.core.sched.output import NewRequestData
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch
@@ -186,6 +189,8 @@ class MambaHybridModelState(DefaultModelState):
         """
         if not self._align_mode:
             return
+        if input_batch.pcp is not None and input_batch.pcp.global_batch is not None:
+            input_batch = input_batch.pcp.global_batch
         num_reqs = input_batch.num_reqs
         if num_reqs == 0:
             return
@@ -240,6 +245,69 @@ class MambaHybridModelState(DefaultModelState):
     ) -> dict[str, Any]:
         assert ubatch_idx == 0, "DBO is not supported"
         assert model_specific_attn_metadata is None
+        pcp = input_batch.pcp
+        if pcp is None:
+            return self._prepare_attn_for_groups(
+                input_batch,
+                cudagraph_mode,
+                block_tables,
+                slot_mappings,
+                attn_groups,
+                kv_cache_config,
+                for_capture=for_capture,
+            )
+
+        non_mamba_groups = [
+            [g for g in groups if not isinstance(g.kv_cache_spec, MambaSpec)]
+            for groups in attn_groups
+        ]
+        mamba_groups = [
+            [g for g in groups if isinstance(g.kv_cache_spec, MambaSpec)]
+            for groups in attn_groups
+        ]
+        attn_metadata: dict[str, Any] = {}
+        if any(non_mamba_groups):
+            attn_metadata.update(
+                self._prepare_attn_for_groups(
+                    input_batch,
+                    cudagraph_mode,
+                    block_tables,
+                    slot_mappings,
+                    non_mamba_groups,
+                    kv_cache_config,
+                    for_capture=for_capture,
+                )
+            )
+        if any(mamba_groups):
+            global_batch = pcp.global_batch or input_batch
+            global_block_tables = pcp.global_block_tables or block_tables
+            mamba_metadata = self._prepare_attn_for_groups(
+                global_batch,
+                cudagraph_mode,
+                global_block_tables,
+                slot_mappings,
+                mamba_groups,
+                kv_cache_config,
+                for_capture=for_capture,
+            )
+            if pcp.gdn_restore_idx is not None:
+                for meta in mamba_metadata.values():
+                    if isinstance(meta, GDNAttentionMetadata):
+                        meta.pcp_restore_idx = pcp.gdn_restore_idx
+                        meta.pcp_local_gather_idx = pcp.gdn_local_gather_idx
+            attn_metadata.update(mamba_metadata)
+        return attn_metadata
+
+    def _prepare_attn_for_groups(
+        self,
+        input_batch: InputBatch,
+        cudagraph_mode: CUDAGraphMode,
+        block_tables: tuple[torch.Tensor, ...],
+        slot_mappings: torch.Tensor,
+        attn_groups: list[list[AttentionGroup]],
+        kv_cache_config: KVCacheConfig,
+        for_capture: bool = False,
+    ) -> dict[str, Any]:
         if cudagraph_mode == CUDAGraphMode.FULL:
             num_reqs = input_batch.num_reqs_after_padding
             num_tokens = input_batch.num_tokens_after_padding
@@ -265,7 +333,9 @@ class MambaHybridModelState(DefaultModelState):
             # as a spec-decode row: the prefill kernels can't roll them back.
             is_prefilling_np = is_prefilling_np & ~input_batch.prefill_runs_as_decode_np
         is_prefilling = torch.zeros(num_reqs, dtype=torch.bool, device="cpu")
-        is_prefilling[: input_batch.num_reqs] = torch.from_numpy(is_prefilling_np)
+        is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
+            is_prefilling_np[: input_batch.num_reqs]
+        )
         # During CUDAGraph capture, num_decode_draft_tokens_cpu and num_accepted_tokens
         # are created by attn_metadata_builder.build_for_cudagraph_capture, so we only
         # compute them during actual (non-capture) forward execution.

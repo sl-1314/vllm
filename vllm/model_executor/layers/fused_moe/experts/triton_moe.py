@@ -696,6 +696,14 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 quantization_emulation=self.quantization_emulation,
             )
 
+        defer_ep_moe_sum = (
+            not hooked
+            and expert_map is not None
+            and getattr(self, "_defer_ep_moe_sum", False)
+        )
+        if defer_ep_moe_sum:
+            intermediate_cache3.zero_()
+
         # LoRA w2: applied to intermediate_cache3 before moe_sum, using the
         # unquantized intermediate_cache2 as the lora_a input.  Reuses the
         # sorted_token_ids_lora computed above. Same dual-stream pattern as
@@ -790,6 +798,8 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
                 ),
                 output,
             )
+        elif defer_ep_moe_sum:
+            return intermediate_cache3
         else:
             self._finalize_expert_output(
                 intermediate_cache3, output, topk_ids, expert_map

@@ -1272,6 +1272,19 @@ class FusedMoEParallelConfig:
         )
 
         if not use_ep:
+            if (
+                envs.VLLM_BATCH_INVARIANT
+                and tp_size_ == 1
+                and (dp_size_ > 1 or pcp_size_ > 1)
+            ):
+                # Keep experts replicated without K-splitting across DP/PCP ranks so
+                # EP=1 with DP>1 or CP>1 remains bitwise invariant with EP=1, DP=1, CP=1.
+                tp_size = 1
+                tp_rank = 0
+                dp_size = 1
+                dp_rank = 0
+                pcp_size = 1
+                pcp_rank = 0
             return FusedMoEParallelConfig(
                 tp_size=tp_size,
                 tp_rank=tp_rank,

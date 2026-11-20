@@ -1339,6 +1339,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     new_req_data.prompt_token_ids,
                 )
 
+            if self.pcp_manager is not None and new_req_data.mm_features:
+                raise NotImplementedError(
+                    "MRV2 PCP does not support multimodal request inputs yet."
+                )
+
             if self.encoder_cache is not None:
                 self.encoder_cache.add_request(req_id, new_req_data.mm_features)
 

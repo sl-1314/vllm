@@ -1238,6 +1238,20 @@ class FusedMoEKernelModularImpl:
             and moe_parallel_config.dp_size > 1
             and moe_parallel_config.use_ep
         )
+        import vllm.envs as envs
+        from vllm.model_executor.layers.fused_moe.experts.triton_moe import (
+            TritonExperts,
+        )
+        from vllm.model_executor.layers.fused_moe.prepare_finalize.naive_dp_ep import (
+            MoEPrepareAndFinalizeNaiveDPEPModular,
+        )
+
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and isinstance(prepare_finalize, MoEPrepareAndFinalizeNaiveDPEPModular)
+            and isinstance(fused_experts, TritonExperts)
+        ):
+            fused_experts._defer_ep_moe_sum = True
 
     def _allocate_buffers(
         self,
@@ -1527,6 +1541,8 @@ class FusedMoEKernelModularImpl:
         # Experts that stopped after GEMM2 wrote nothing into `fused_out`; the
         # top-k reduction they left open belongs to whoever takes this.
         if isinstance(unfinalized, UnfinalizedMoEOutput):
+            return unfinalized
+        if isinstance(unfinalized, torch.Tensor) and unfinalized.ndim == 3:
             return unfinalized
 
         return fused_out

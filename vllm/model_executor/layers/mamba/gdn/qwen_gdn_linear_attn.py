@@ -24,6 +24,7 @@ from vllm.config import (
 from vllm.distributed import (
     divide,
 )
+from vllm.distributed.parallel_state import get_pcp_group
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
@@ -311,6 +312,9 @@ def _resolve_gdn_prefill_backend(
         )
 
     if not current_platform.is_cuda():
+        return backend, "triton"
+
+    if envs.VLLM_BATCH_INVARIANT:
         return backend, "triton"
 
     supports_flashinfer = False
@@ -773,6 +777,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         ba_method = self.in_proj_ba.quant_method
         if (
             overlap_ba_proj
+            and not envs.VLLM_BATCH_INVARIANT
             and current_platform.is_cuda()
             and isinstance(ba_method, UnquantizedLinearMethod)
             and ba_method._gemm_impl is cuda_unquantized_gemm
@@ -863,6 +868,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
         self.enable_packed_recurrent_decode = (
             envs.VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE
+            and not envs.VLLM_BATCH_INVARIANT
         )
         # Off by default; the Qwen3.5 NVIDIA variant passes a fused gated RMS
         # norm that reads z strided from the packed qkvz projection and
@@ -1819,19 +1825,59 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
 
+        pcp_restore_idx = attn_metadata.pcp_restore_idx
+        pcp_local_gather_idx = attn_metadata.pcp_local_gather_idx
+        local_core_attn_out: torch.Tensor | None = None
+        if pcp_restore_idx is not None:
+            assert pcp_local_gather_idx is not None
+            pcp_group = get_pcp_group()
+            local_core_attn_out = core_attn_out
+            qkv_dim = mixed_qkv.shape[-1]
+            b_dim = b.shape[-1]
+            a_dim = a.shape[-1]
+            if mixed_qkv.dtype == b.dtype == a.dtype:
+                packed_local = torch.cat((mixed_qkv, b, a), dim=-1)
+                packed_global = pcp_group.all_gather(packed_local, dim=0)
+                packed_global = packed_global[pcp_restore_idx]
+                mixed_qkv, b, a = packed_global.split([qkv_dim, b_dim, a_dim], dim=-1)
+                mixed_qkv = mixed_qkv.contiguous()
+                b = b.contiguous()
+                a = a.contiguous()
+            else:
+                mixed_qkv = pcp_group.all_gather(mixed_qkv.contiguous(), dim=0)[
+                    pcp_restore_idx
+                ]
+                b = pcp_group.all_gather(b.contiguous(), dim=0)[pcp_restore_idx]
+                a = pcp_group.all_gather(a.contiguous(), dim=0)[pcp_restore_idx]
+            core_attn_out = torch.empty(
+                (
+                    pcp_restore_idx.shape[0],
+                    local_core_attn_out.shape[1],
+                    local_core_attn_out.shape[2],
+                ),
+                dtype=local_core_attn_out.dtype,
+                device=local_core_attn_out.device,
+            )
+
         if (
             self.enable_packed_recurrent_decode
             and attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
         ):
-            return self._forward_core_decode_non_spec(
+            self._forward_core_decode_non_spec(
                 mixed_qkv=mixed_qkv,
                 b=b,
                 a=a,
                 core_attn_out=core_attn_out,
                 attn_metadata=attn_metadata,
             )
+            if local_core_attn_out is not None:
+                assert pcp_local_gather_idx is not None
+                torch.index_select(
+                    core_attn_out, 0, pcp_local_gather_idx, out=local_core_attn_out
+                )
+            return
 
         has_initial_state = attn_metadata.has_initial_state
         spec_query_start_loc = attn_metadata.spec_query_start_loc
@@ -1940,7 +1986,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         )
         num_decode_tokens = attn_metadata.num_decode_tokens
 
-        if attn_metadata.num_prefills > 0:
+        if attn_metadata.num_prefills > 0 and not envs.VLLM_BATCH_INVARIANT:
             assert mixed_qkv_non_spec is not None, (
                 "mixed_qkv_non_spec must be provided for prefill path"
             )
@@ -1983,6 +2029,27 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             value_non_spec = value_non_spec.unsqueeze(0)
             g_non_spec = g_non_spec.unsqueeze(0)
             beta_non_spec = beta_non_spec.unsqueeze(0)
+        elif attn_metadata.num_prefills > 0 and envs.VLLM_BATCH_INVARIANT:
+            assert mixed_qkv_non_spec is not None
+            if spec_sequence_masks is not None:
+                a_non_spec = a.index_select(0, non_spec_token_indx)
+                b_non_spec = b.index_select(0, non_spec_token_indx)
+            else:
+                a_non_spec = a
+                b_non_spec = b
+            if split_non_spec:
+                conv_output_prefill = mixed_qkv_non_spec[num_decode_tokens:]
+                a_prefill = a_non_spec[num_decode_tokens:]
+                b_prefill = b_non_spec[num_decode_tokens:]
+            else:
+                conv_output_prefill = mixed_qkv_non_spec
+                a_prefill = a_non_spec
+                b_prefill = b_non_spec
+            query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
+                conv_output_prefill
+            )
+            g_non_spec = None
+            beta_non_spec = None
         else:
             query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(
                 mixed_qkv_non_spec
@@ -2052,7 +2119,53 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             prefill_has_initial_state = attn_metadata.prefill_has_initial_state
             assert prefill_state_indices is not None
             assert prefill_has_initial_state is not None
-            if self.gdn_prefill_backend == "flashinfer":
+            if envs.VLLM_BATCH_INVARIANT:
+                checkpoint = attn_metadata.checkpoint
+                checkpoint_state = None
+                checkpoint_offsets = None
+                first_ckpt = 0
+                if checkpoint is not None:
+                    num_rows = checkpoint.checkpoint_offsets.shape[0]
+                    (checkpoint_state,) = current_workspace_manager().get_simultaneous(
+                        self._checkpoint_buffer_spec
+                    )
+                    checkpoint_state = checkpoint_state[:num_rows]
+                    first_ckpt = num_rows - prefill_state_indices.shape[0]
+                    checkpoint_offsets = checkpoint.checkpoint_offsets[first_ckpt:]
+                core_attn_out_non_spec, _ = fused_sigmoid_gating_delta_rule_update(
+                    A_log=self.A_log,
+                    a=a_prefill,
+                    b=b_prefill,
+                    dt_bias=self.dt_bias,
+                    q=query_non_spec,
+                    k=key_non_spec,
+                    v=value_non_spec,
+                    initial_state=ssm_state,
+                    inplace_final_state=True,
+                    cu_seqlens=attn_metadata.prefill_query_start_loc,
+                    ssm_state_indices=prefill_state_indices,
+                    has_initial_state=prefill_has_initial_state,
+                    checkpoint_state=(
+                        checkpoint_state[first_ckpt:]
+                        if checkpoint_state is not None
+                        else None
+                    ),
+                    checkpoint_offsets=checkpoint_offsets,
+                    use_qk_l2norm_in_kernel=True,
+                )
+                if checkpoint is not None:
+                    assert conv_input_non_spec is not None
+                    assert attn_metadata.non_spec_query_start_loc is not None
+                    assert checkpoint_state is not None
+                    self._checkpoint_exporter.export(
+                        checkpoint,
+                        raw_qkv=conv_input_non_spec,
+                        conv_state=conv_state,
+                        recurrent_checkpoint=checkpoint_state,
+                        recurrent_state=ssm_state,
+                        cu_seqlens=attn_metadata.non_spec_query_start_loc,
+                    )
+            elif self.gdn_prefill_backend == "flashinfer":
                 # Without spec decodes the prefill rows follow the peeled
                 # decodes contiguously, so FlashInfer writes them straight
                 # into core_attn_out. Spec batches scatter by token index.
@@ -2110,7 +2223,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     aiter_prefill_metadata=attn_metadata.aiter_prefill_metadata,
                 )
             # Init cache
-            scatter_states(ssm_state, last_recurrent_state, prefill_state_indices)
+            if not envs.VLLM_BATCH_INVARIANT:
+                scatter_states(ssm_state, last_recurrent_state, prefill_state_indices)
 
             if split_non_spec and prefill_in_place:
                 core_attn_out[:num_decode_tokens] = core_attn_out_decode.squeeze(0)
@@ -2153,6 +2267,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         elif not prefill_in_place:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+
+        if local_core_attn_out is not None:
+            assert pcp_local_gather_idx is not None
+            torch.index_select(
+                core_attn_out, 0, pcp_local_gather_idx, out=local_core_attn_out
+            )
 
     def _forward_flashinfer_prefill(
         self,
@@ -2610,7 +2730,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             a=a,
             core_attn_out=core_attn_out,
         )
-        num_actual_tokens = attn_metadata.num_actual_tokens
+        num_actual_tokens = (
+            output_gate.shape[0]
+            if attn_metadata.pcp_local_gather_idx is not None
+            else attn_metadata.num_actual_tokens
+        )
         self._rms_norm_gated_cuda(
             core_attn_out[:num_actual_tokens],
             output_gate[:num_actual_tokens],

@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.parallel_state import get_dcp_group, get_pcp_group
 from vllm.logger import init_logger
@@ -37,6 +38,11 @@ class PCPBatchMetadata:
     global_seq_lens_cpu_upper_bound_np: np.ndarray
     # [num_reqs_after_padding], set only under PCP+DCP.
     dcp_local_seq_lens_cpu_upper_bound: torch.Tensor | None = None
+    # Global batch and block tables for layers (e.g. GDN) that run on global tokens.
+    global_batch: InputBatch | None = None
+    global_block_tables: tuple[torch.Tensor, ...] | None = None
+    gdn_restore_idx: torch.Tensor | None = None
+    gdn_local_gather_idx: torch.Tensor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +110,22 @@ class PCPManager:
         )
         self._max_num_local_reqs = max_num_local_reqs
         self._max_num_tokens = max_num_tokens
+        buf_size = max(max_num_tokens or 0, max_num_reqs or 0) * pcp_world_size
+        self._gdn_restore_idx = (
+            torch.zeros(buf_size, dtype=torch.int64, device=device)
+            if buf_size > 0
+            else None
+        )
+        self._gdn_local_gather_idx = (
+            torch.zeros(buf_size, dtype=torch.int64, device=device)
+            if buf_size > 0
+            else None
+        )
+        self._gdn_arange_buf = (
+            torch.arange(buf_size, dtype=torch.int64, device=device)
+            if buf_size > 0
+            else None
+        )
         self.set_block_tables(block_tables)
 
     def set_block_tables(self, block_tables: BlockTables | None) -> None:
@@ -164,13 +186,19 @@ class PCPManager:
         if pcp_size <= 1:
             return
 
-        if not model_config.use_mla:
-            raise NotImplementedError("MRV2 PCP currently supports MLA models only.")
+        is_qwen35 = model_config.hf_text_config.model_type in (
+            "qwen3_5_text",
+            "qwen3_5_moe_text",
+        )
+        if not model_config.use_mla and not is_qwen35:
+            raise NotImplementedError(
+                "MRV2 PCP currently supports MLA and Qwen3.5 models only."
+            )
         if model_config.is_encoder_decoder:
             raise NotImplementedError(
                 "MRV2 PCP does not support encoder-decoder models yet."
             )
-        if supports_mm_inputs:
+        if supports_mm_inputs and not is_qwen35:
             raise NotImplementedError("MRV2 PCP does not support MM inputs yet.")
         if vllm_config.lora_config is not None:
             raise NotImplementedError("MRV2 PCP does not support LoRA yet.")
@@ -453,6 +481,14 @@ class PCPManager:
         assert self._global_batch is not None
         return self._global_batch
 
+    @property
+    def local_num_decode_tokens(self) -> int:
+        if self._local_batch is None:
+            return 0
+        is_prefill = self._local_batch.is_prefilling_np[: self._local_batch.num_reqs]
+        sched = self._local_batch.num_scheduled_tokens[: self._local_batch.num_reqs]
+        return int(sched[~is_prefill].sum())
+
     def partition_batch(
         self, input_batch: InputBatch, batch_desc: "BatchExecutionDescriptor"
     ) -> InputBatch:
@@ -646,8 +682,7 @@ class PCPManager:
         real_local_is_prefilling_np = (
             local_num_computed_prefill_tokens_np < local_prefill_len_np
         )
-        local_is_prefilling_np = np.zeros(num_reqs_after_padding, dtype=np.bool_)
-        local_is_prefilling_np[:num_local_reqs] = real_local_is_prefilling_np
+        local_is_prefilling_np = real_local_is_prefilling_np
         local_has_prefill = bool(local_is_prefilling_np.any())
         seq_lens_cpu_upper_bound_np = np.zeros(num_reqs_after_padding, dtype=np.int32)
         seq_lens_cpu_upper_bound_np[:num_local_reqs] = (
@@ -672,6 +707,25 @@ class PCPManager:
             dcp_local_seq_lens_cpu_upper_bound[:num_local_reqs].copy_(
                 real_dcp_local_seq_lens_cpu_upper_bound
             )
+
+        gdn_restore_idx = self._hidden_restore_idx
+        gdn_local_gather_idx = local_gather_idx
+        if (
+            batch_desc.cg_mode == CUDAGraphMode.FULL
+            and self._gdn_restore_idx is not None
+        ):
+            assert self._hidden_restore_idx is not None
+            assert self._gdn_local_gather_idx is not None
+            global_num_tokens = global_batch.num_tokens
+            global_num_tokens_padded = global_batch.num_tokens_after_padding
+            self._gdn_restore_idx[:global_num_tokens].copy_(self._hidden_restore_idx)
+            if global_num_tokens_padded > global_num_tokens:
+                self._gdn_restore_idx[
+                    global_num_tokens:global_num_tokens_padded
+                ].zero_()
+            self._gdn_local_gather_idx[:num_local_tokens_padded].copy_(local_gather_idx)
+            gdn_restore_idx = self._gdn_restore_idx[:global_num_tokens_padded]
+            gdn_local_gather_idx = self._gdn_local_gather_idx[:num_local_tokens_padded]
 
         self._local_batch = replace(
             input_batch,
@@ -701,6 +755,9 @@ class PCPManager:
                     local_to_global_batch_req_idx_np
                 ],
                 dcp_local_seq_lens_cpu_upper_bound=dcp_local_seq_lens_cpu_upper_bound,
+                global_batch=global_batch,
+                gdn_restore_idx=gdn_restore_idx,
+                gdn_local_gather_idx=gdn_local_gather_idx,
             ),
             num_computed_tokens_np=local_start_pos_np,
             prefill_len_np=local_prefill_len_np,
@@ -727,6 +784,21 @@ class PCPManager:
         input_buffers = self.input_buffers
         num_reqs = input_batch.num_reqs_after_padding
         num_tokens = input_batch.num_tokens_after_padding
+        pcp = None
+        if self._gdn_restore_idx is not None:
+            assert self._gdn_local_gather_idx is not None
+            assert self._gdn_arange_buf is not None
+            self._gdn_restore_idx[:num_tokens].copy_(self._gdn_arange_buf[:num_tokens])
+            self._gdn_local_gather_idx[:num_tokens].copy_(
+                self._gdn_arange_buf[:num_tokens]
+            )
+            pcp = PCPBatchMetadata(
+                global_num_tokens=num_tokens,
+                global_query_lens_np=input_batch.num_scheduled_tokens,
+                global_seq_lens_cpu_upper_bound_np=input_batch.seq_lens_cpu_upper_bound.numpy(),
+                gdn_restore_idx=self._gdn_restore_idx[:num_tokens],
+                gdn_local_gather_idx=self._gdn_local_gather_idx[:num_tokens],
+            )
         input_batch = replace(
             input_batch,
             input_ids=input_buffers.input_ids[:num_tokens].copy_(input_batch.input_ids),
@@ -738,6 +810,7 @@ class PCPManager:
                 input_batch.query_start_loc
             ),
             seq_lens=input_buffers.seq_lens[:num_reqs].copy_(input_batch.seq_lens),
+            pcp=pcp,
         )
         return input_batch
 
@@ -752,6 +825,8 @@ class PCPManager:
 
     def get_dummy_block_tables(self, num_reqs: int) -> tuple[torch.Tensor, ...]:
         assert self._local_block_tables is not None
+        if self._block_tables is not None:
+            self._block_tables.get_dummy_block_tables(num_reqs)
         return tuple(
             block_table[:num_reqs].zero_() for block_table in self._local_block_tables
         )
@@ -768,6 +843,15 @@ class PCPManager:
             out=self._local_block_tables,
             out_ptrs=self._local_block_table_ptrs,
         )
+        if input_batch.pcp is not None and input_batch.pcp.global_batch is not None:
+            global_batch = input_batch.pcp.global_batch
+            global_block_tables = self._block_tables.gather_block_tables(
+                global_batch.idx_mapping,
+                global_batch.num_reqs_after_padding,
+            )
+            input_batch.pcp = replace(
+                input_batch.pcp, global_block_tables=global_block_tables
+            )
         slot_mappings = self.prepare_slot_mappings()
         return block_tables, slot_mappings
 
@@ -916,6 +1000,13 @@ def maybe_build_pcp_manager(
     dcp_size = parallel_config.decode_context_parallel_size
     dcp_rank = get_dcp_group().rank_in_group if dcp_size > 1 else 0
 
+    moe_gathers_tokens = (
+        not parallel_config.enable_expert_parallel
+        and not (
+            envs.VLLM_BATCH_INVARIANT
+            and parallel_config.tensor_parallel_size == 1
+        )
+    )
     return cls(
         pcp_world_size=pcp_size,
         pcp_rank=pcp_rank,
@@ -928,5 +1019,5 @@ def maybe_build_pcp_manager(
         dcp_rank=dcp_rank,
         cp_interleave=parallel_config.cp_kv_cache_interleave_size,
         # Without EP all2all kernels, MoERunner all-gathers PCP tokens to route.
-        moe_gathers_tokens=not parallel_config.enable_expert_parallel,
+        moe_gathers_tokens=moe_gathers_tokens,
     )

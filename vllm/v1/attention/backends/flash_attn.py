@@ -39,6 +39,7 @@ from vllm.v1.attention.ops.dcp import (
     cp_lse_ag_out_rs,
     dcp_a2a_lse_reduce,
 )
+from vllm.v1.attention.ops.pcp import maybe_gather_kv_cache_inputs
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -50,6 +51,7 @@ if is_flash_attn_varlen_func_available():
         get_scheduler_metadata,
         reshape_and_cache_flash,
     )
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 import vllm.envs as envs
 from vllm.config import (
     VllmConfig,
@@ -60,7 +62,11 @@ from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_dcp_world_size_and_rank,
+    get_pcp_group,
 )
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.forward_context import get_forward_context, in_piecewise_cudagraph
+from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
 from vllm.utils.math_utils import round_up
@@ -708,6 +714,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         self.dcp_world_size, self.dcp_rank = get_dcp_world_size_and_rank(
             kv_cache_spec.dcp_sharded
         )
+        self.pcp_world_size = self.parallel_config.prefill_context_parallel_size
 
         # Fused draft decode reuses the captured metadata object across draft
         # steps. For DCP, build-time host-side decisions such as
@@ -852,6 +859,16 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
         num_prefill_reqs = 0
         num_decode_tokens = 0
         num_prefill_tokens = 0
+        if self.pcp_world_size > 1:
+            query_lens_cpu = (
+                common_attn_metadata.query_start_loc_cpu[1 : num_reqs + 1]
+                - common_attn_metadata.query_start_loc_cpu[:num_reqs]
+            )
+            if common_attn_metadata.is_prefilling is not None:
+                is_prefill_cpu = common_attn_metadata.is_prefilling[:num_reqs]
+                num_decode_tokens = int(query_lens_cpu[~is_prefill_cpu].sum().item())
+            else:
+                num_decode_tokens = int(query_lens_cpu[query_lens_cpu == 1].sum().item())
 
         if self.dcp_world_size > 1:
             query_lens = query_start_loc[1:] - query_start_loc[:-1]
@@ -1036,6 +1053,7 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
 class FlashAttentionImpl(AttentionImpl):
     can_return_lse_for_decode: bool = True
     supports_dcp: bool = True
+    supports_pcp: bool = True
 
     def __init__(
         self,
@@ -1135,6 +1153,10 @@ class FlashAttentionImpl(AttentionImpl):
             and vllm_config.parallel_config.dcp_comm_backend == "a2a"
         )
         self.dcp_combine = dcp_a2a_lse_reduce if dcp_a2a else cp_lse_ag_out_rs
+        self.pcp_shard_decode_requests = (
+            vllm_config is not None
+            and vllm_config.parallel_config.pcp_shard_decode_requests
+        )
 
         self._dcp_dtype: torch.dtype | None = None
         self._dcp_max_num_tokens: int = 0
@@ -1236,6 +1258,9 @@ class FlashAttentionImpl(AttentionImpl):
                 attn_metadata,
                 layer,
             )
+
+        if num_actual_tokens == 0:
+            return output
 
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
@@ -1416,6 +1441,24 @@ class FlashAttentionImpl(AttentionImpl):
             # we use direct Q, K, V tensors without caching
             return
 
+        if self.pcp_world_size > 1:
+            if in_piecewise_cudagraph():
+                key, value, slot_mapping = self._gather_pcp_cache_inputs(
+                    layer.layer_name, key, value, slot_mapping
+                )
+            else:
+                attn_metadata = get_attention_context(layer.layer_name)[0]
+                if attn_metadata is None:
+                    return
+                key, value, slot_mapping = maybe_gather_kv_cache_inputs(
+                    key,
+                    value,
+                    slot_mapping,
+                    attn_metadata.num_decode_tokens,
+                    True,
+                    pcp_shard_decode_requests=self.pcp_shard_decode_requests,
+                )
+
         # Scatter write into the KV cache using slot_mapping indices.
         # No TMA kernel is invoked here, so stride canonicalization is not needed.
         # (B, H, N, 2*D) -> ((B, N, H, D), (B, N, H, D))
@@ -1438,6 +1481,50 @@ class FlashAttentionImpl(AttentionImpl):
             layer._k_scale,
             layer._v_scale,
         )
+
+    def _gather_pcp_cache_inputs(
+        self,
+        layer_name: str,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_rows = self.pcp_world_size * key.shape[0]
+        out = (
+            key.new_empty((num_rows, *key.shape[1:])),
+            value.new_empty((num_rows, *value.shape[1:])),
+            slot_mapping.new_empty(num_rows),
+        )
+        self._gather_pcp_cache_inputs_into(layer_name, key, value, *out)
+        return out
+
+    @eager_break_during_capture
+    def _gather_pcp_cache_inputs_into(
+        self,
+        layer_name: str,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        out_key: torch.Tensor,
+        out_value: torch.Tensor,
+        out_slot_mapping: torch.Tensor,
+    ) -> None:
+        attn_metadata, _, _, slot_mapping = get_attention_context(layer_name)
+        if attn_metadata is None or slot_mapping is None:
+            out_slot_mapping.fill_(PAD_SLOT_ID)
+            return
+        key, value, slot_mapping = maybe_gather_kv_cache_inputs(
+            key,
+            value,
+            slot_mapping,
+            attn_metadata.num_decode_tokens,
+            True,
+            pcp_shard_decode_requests=self.pcp_shard_decode_requests,
+        )
+        num_rows = slot_mapping.shape[0]
+        out_key[:num_rows].copy_(key)
+        out_value[:num_rows].copy_(value)
+        out_slot_mapping[:num_rows].copy_(slot_mapping)
+        out_slot_mapping[num_rows:].fill_(PAD_SLOT_ID)
 
     def _forward_with_dcp(
         self,

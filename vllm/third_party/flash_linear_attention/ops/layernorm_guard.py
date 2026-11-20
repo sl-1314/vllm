@@ -178,6 +178,10 @@ def layer_norm_fwd_kernel(
 
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
+    import vllm.envs as envs
+
+    if envs.VLLM_BATCH_INVARIANT:
+        return 1
     sm_count = num_compute_units(device.index)
     rows_per_block = next_power_of_2(cdiv(M, 2 * sm_count))
     rows_per_block = min(rows_per_block, 4)

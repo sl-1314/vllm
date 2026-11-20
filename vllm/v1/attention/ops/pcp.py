@@ -88,6 +88,30 @@ def maybe_gather_mla_latent_cache_inputs(
     return cache_kv_c, cache_k_pe, cache_slot_mapping
 
 
+def maybe_gather_kv_cache_inputs(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    num_decode_tokens: int | None,
+    use_pcp: bool,
+    pcp_shard_decode_requests: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not use_pcp or num_decode_tokens is None:
+        return key, value, slot_mapping
+    num_tokens = key.shape[0]
+    key_flat = key.reshape(num_tokens, -1)
+    value_flat = value.reshape(num_tokens, -1)
+    (cache_k_flat, cache_v_flat), cache_slot_mapping = _gather_prefill_cache_inputs(
+        (key_flat, value_flat),
+        slot_mapping,
+        num_decode_tokens,
+        pcp_shard_decode_requests,
+    )
+    cache_k = cache_k_flat.view(-1, *key.shape[1:])
+    cache_v = cache_v_flat.view(-1, *value.shape[1:])
+    return cache_k, cache_v, cache_slot_mapping
+
+
 def maybe_gather_indexer_k(
     k: torch.Tensor,
     slot_mapping: torch.Tensor,

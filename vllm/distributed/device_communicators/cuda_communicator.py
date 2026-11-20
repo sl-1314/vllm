@@ -431,6 +431,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = aiter_ar_comm.custom_all_reduce(input_)
             assert out is not None
             return out
+        if (
+            envs.VLLM_BATCH_INVARIANT
+            and (current_platform.is_rocm() or current_platform.is_cuda())
+            and input_.is_floating_point()
+        ):
+            # Integer sums are exact in any order and stay on RCCL/NCCL.
+            from vllm.model_executor.determinism.batch_invariant import (
+                all_reduce_batch_invariant,
+            )
+
+            return all_reduce_batch_invariant(input_, self.device_group)
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
@@ -440,17 +451,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
             out = ca_comm.custom_all_reduce(input_)
             assert out is not None
             return out
-        if (
-            envs.VLLM_BATCH_INVARIANT
-            and current_platform.is_rocm()
-            and input_.is_floating_point()
-        ):
-            # Integer sums are exact in any order and stay on RCCL.
-            from vllm.model_executor.determinism.batch_invariant import (
-                all_reduce_batch_invariant,
-            )
-
-            return all_reduce_batch_invariant(input_, self.device_group)
         symm_mem_comm = self.symm_mem_comm
         if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
             out = symm_mem_comm.all_reduce(input_)
@@ -569,7 +569,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
 
         if (
             envs.VLLM_BATCH_INVARIANT
-            and current_platform.is_rocm()
+            and (current_platform.is_rocm() or current_platform.is_cuda())
             and input_.is_floating_point()
         ):
             from vllm.model_executor.determinism.batch_invariant import (

@@ -37,6 +37,7 @@ from transformers import (
     Qwen3_5TextConfig,
 )
 
+from vllm import envs
 from vllm.config import MultiModalConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
@@ -307,7 +308,8 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
         # Defer row-parallel all-reduces to the following norm
         # (deepseek_v32 pattern); exclude PP and SP.
         self.use_fused_allreduce_norm = (
-            get_tensor_model_parallel_world_size() > 1
+            not envs.VLLM_BATCH_INVARIANT
+            and get_tensor_model_parallel_world_size() > 1
             and parallel_config.pipeline_parallel_size == 1
             and not self.use_attn_reduce_scatter_for_moe
             and flashinfer_trtllm_fused_allreduce_norm is not None

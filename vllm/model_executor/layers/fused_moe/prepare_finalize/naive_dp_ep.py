@@ -5,6 +5,7 @@ from contextlib import contextmanager
 
 import torch
 
+import vllm._custom_ops as ops
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.distributed import get_ep_group
 from vllm.model_executor.layers.fused_moe.config import FusedMoEQuantConfig
@@ -254,6 +255,18 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         apply_router_weight_on_input: bool,
         weight_and_reduce_impl: mk.TopKWeightAndReduce,
     ) -> None:
+        if (
+            fused_expert_output.ndim == 3
+            and isinstance(weight_and_reduce_impl, TopKWeightAndReduceNoOP)
+        ):
+            with self._comm_region():
+                local_slots = get_ep_group().combine(
+                    fused_expert_output,
+                    is_sequence_parallel=self.is_sequence_parallel,
+                )
+            ops.moe_sum(local_slots, output)
+            return
+
         if isinstance(weight_and_reduce_impl, TopKWeightAndReduceDelegate):
             weight_and_reduce_impl = TopKWeightAndReduceContiguous()
 
